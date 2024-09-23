@@ -222,6 +222,302 @@ local function bold_name(args)
 end
 
 --------------------------------------------------------------------------------
+
+---@class Entry : { [integer]: FunctionDef }
+---@field name string
+---@field type string
+---@field descr string[]
+---@field show string[]
+---@field version string?
+---@field deprecated true | string?
+---@field classname string?
+
+---@class FunctionDef
+---@field generic string?
+---@field params { name: string, type: string, comment: string? }[]
+---@field paramlist string[]
+---@field signature string
+---@field returns { type: string, comment: string? }
+
+local function trim(item)
+    return (item:gsub("^%s*", ""):gsub("%s*$", ""))
+end
+
+--- Builds all combinations of possible overloads using square bracket optionals.
+local function buildOverloads(cur, i, paramList, acc)
+    local param = paramList[i]
+    if not param then
+        acc[#acc+1] = cur
+    elseif not param.optional then
+        cur[#cur+1] = param
+        return buildOverloads(cur, i + 1, paramList, acc)
+    else
+        local alt = {}
+        for j = 1, #cur do
+            alt[j] = cur[j]
+        end
+        cur[#cur+1] = param
+        buildOverloads(cur, i + 1, paramList, acc)
+        buildOverloads(alt, i + 1, paramList, acc)
+    end
+end
+
+--- Formats entries which are easier to write
+---@param groups Group[]
+---@return Entry[]
+local function formatEntries(groups)
+    local classes = {
+        -- Sometimes the class is called argmatcher
+        argmatcher = "clink._argmatcher"
+    }
+
+    for _, group in ipairs(groups) do
+        if (not _G[group.name] or group.name == 'path') and group.name ~= 'Deprecated' and group.name ~= '[other]' then
+            local class = group.name == 'clink' and group.name or 'clink.'..group.name
+            classes[group.name] = class
+        end
+    end
+
+    ---@type Entry[]
+    local result = {}
+    for _, group in ipairs(groups) do
+        table.sort(group, function(a, b) return a.name[1] < b.name[1] end)
+        if classes[group.name] then
+            result[#result+1] = {
+                name = group.name,
+                classname = classes[group.name],
+                type = 'class',
+                descr = {},
+                show = {},
+            } --[[@as Entry]]
+
+            if group.name == 'clink' then
+                -- Add clink.arg as a class to prevent later undefined field `arg` warnings
+                result[#result+1] = {
+                    name = 'clink.arg',
+                    classname = 'clink.arg',
+                    type = 'class',
+                    descr = {},
+                    show = {}
+                }
+            end
+        end
+        for _, doc_tag in ipairs(group) do
+            local name = doc_tag.name[1]
+
+            local function linkTypes(item)
+                if item == 'self' then
+                    return 'clink.'..name:match "^[^%.:]*"
+                elseif item == 'file' then
+                    return 'file*'
+                elseif item == 'coroutine' then
+                    return 'thread'
+                elseif item == 'iterator' then
+                    return 'fun(): string'
+                elseif classes[item] then
+                    return classes[item]
+                end
+                return item
+            end
+
+            --- Replaces any type found in string with correct classname
+            local function parseTypes(str)
+                if type(str) ~= 'string' then error("Expected string, got "..type(str), 2) end
+                str = str:gsub('<a%s+href="#[^"]+">([^<]*)</a>', '%1')
+                str = str:gsub('[%a_][%w_]*', linkTypes)
+                -- "table of Xs" is just "X[]"
+                str = str:gsub('table of ([%w_]-)s', '%1[]')
+                return str
+            end
+
+            ---@type Entry
+            local entry = {
+                name = table.concat(doc_tag.name),
+                deprecated = doc_tag.deprecated and doc_tag.deprecated[1] or group.name == 'Deprecated' or nil,
+                descr = doc_tag.desc1 or {},
+                show = doc_tag.show1 or {},
+                type = not doc_tag.var and 'function' or doc_tag.var[1],
+                version = doc_tag.ver and doc_tag.ver[1],
+            }
+
+            entry.deprecated = entry.deprecated and #entry.deprecated > 0 and entry.deprecated or nil
+
+            -- There is really only one function using generics
+            local ret, returnFromFunc = table.concat(doc_tag.ret or {}, ", "):gsub('return value from func', 'T')
+            local generic = returnFromFunc > 0 and 'T' or nil
+
+            local params = {}
+            for _, arg in ipairs(doc_tag.arg or {}) do
+                local optional = arg:match "%b[]"
+                if optional then
+                    arg = optional:sub(2, -2)
+                end
+                local paramname, type = arg:match "^([^:]+):?([^:]-)$"
+                type = parseTypes(type)
+                local comment = paramname:match"([^%.]*)%.%.%."
+                if comment then
+                    paramname = "..."
+                    comment = #comment > 0 and comment or nil
+                end
+                type = #type > 0 and type or 'any'
+                params[#params+1] = {
+                    name = paramname,
+                    comment = comment,
+                    type = type,
+                    optional = optional and true or false
+                }
+            end
+
+            local returnTypeDoc = {}
+            if #ret > 0 then
+                ret = parseTypes(ret)
+                local nextOptional
+                for t in ret:gmatch "[^,]+" do
+                    local actual = trim(t:gsub("[][]", ""))
+                    local comment, returnType = actual:match "^([^:]-):?([^:]+)$"
+                    local optional = nextOptional or t:find "^%["
+
+                    returnTypeDoc[#returnTypeDoc+1] = {
+                        comment = comment,
+                        type = returnType..(optional and '?' or ''),
+                    }
+
+                    nextOptional = t:find "%[%s*$"
+                end
+            end
+
+            local overloads = {}
+            buildOverloads({}, 1, params, overloads)
+
+            local simpleReturnList do
+                local returnTypeList = {}
+                for _, item in ipairs(returnTypeDoc) do
+                    returnTypeList[#returnTypeList+1] = item.type
+                end
+                simpleReturnList = table.concat(returnTypeList, ', ')
+            end
+
+            for i, overload in ipairs(overloads) do
+                ---@type FunctionDef
+                local def = {
+                    paramlist = {},
+                    params = {},
+                    returns = returnTypeDoc,
+                    signature = "",
+                    generic = generic
+                }
+                local typedList = {}
+                for _, param in ipairs(overload) do
+                    def.params[#def.params+1] = param
+                    def.paramlist[#def.paramlist+1] = param.name
+                    typedList[#typedList+1] = param.name..": "..param.type
+                end
+
+                def.signature = string.format("fun(%s)%s", table.concat(typedList, ', '), #returnTypeDoc > 0 and ": "..simpleReturnList or '')
+
+                entry[#entry+1] = def
+            end
+
+            result[#result+1] = entry
+        end
+    end
+
+    return result
+end
+
+---@class Group : { [integer]: Item }
+---@field name string
+
+---@class Item
+---@field name string[]
+---@field ret string[]
+---@field desc1 string[]
+---@field show1 string[]
+---@field arg string[]
+---@field ver string[]
+---@field var string[]
+---@field deprecated string[]?
+
+
+local DEFAULT_VAR = {
+    string = '""',
+    integer = '0',
+    table = '{}',
+}
+
+---@param groups Group[]
+local function do_lua_definitions(groups)
+    local def = assert(io.open('docs/clink-defs.lua', 'w'))
+    local function emit(...)
+        for _, item in ipairs { ... } do
+            def:write(tostring(item))
+        end
+        def:write '\n'
+    end
+
+    local function emitf(fmt, ...)
+        if type(fmt) ~= 'string' then error("Expected string, got "..type(fmt), 2) end
+        emit(fmt:format(...))
+    end
+
+    local formatted = formatEntries(groups)
+
+    emit("---@meta\n")
+    for _, entry in ipairs(formatted) do
+        if entry.version then
+            emitf("--- v%s or newer\n---", entry.version)
+        elseif entry.deprecated then
+            emit "---@deprecated"
+            if type(entry.deprecated) == 'string' then
+                emitf("---@see %s", entry.deprecated:gsub(':', '.'))
+            end
+        end
+
+        for _, line in ipairs(entry.descr) do
+            emitf("--- %s", line)
+        end
+
+        if #entry.show > 0 then
+            emit "--- ```lua"
+            for _, line in ipairs(entry.show) do
+                emitf("--- %s", line:gsub("&[^;]*;", ''))
+            end
+            emit "--- ```"
+        end
+
+        local first = entry[1]
+
+        if entry.type == 'class' then
+            emitf("---@class %s", entry.classname)
+            emitf("_G.%s = {}", entry.name)
+        elseif entry.type == 'function' then
+            if first.generic then
+                emitf("---@generic %s", first.generic)
+            end
+
+            for _, param in ipairs(first.params) do
+                emitf("---@param %s %s%s", param.name, param.type, param.comment and ' # '..param.comment or '')
+            end
+
+            for _, ret in ipairs(first.returns) do
+                emitf("---@return %s%s", ret.type, ret.commant and ' # '..ret.comment or '')
+            end
+
+            for i = 2, #entry do
+                local overload = entry[i]
+                emitf("---@overload %s", overload.signature)
+            end
+            emitf("function %s(%s) end", entry.name, table.concat(first.paramlist, ', '))
+        else
+            emitf("---@type %s", entry.type)
+            emitf("_G.%s = %s", entry.name, DEFAULT_VAR[entry.type])
+        end
+
+        emit()
+    end
+end
+
+--------------------------------------------------------------------------------
 local function do_docs()
     local tmp_path = ".build/docs/clink_tmp"
     out_path = ".build/docs/clink.html"
@@ -262,6 +558,11 @@ local function do_docs()
     end
 
     table.sort(groups, compare_groups)
+
+    local ok, err = xpcall(do_lua_definitions, debug.traceback, groups)
+    if not ok then
+        error(err)
+    end
 
     local api_html = io.open(".build/docs/api_html", "w")
     api_html:write('<h3 id="lua-api-groups">API groups</h3>')
